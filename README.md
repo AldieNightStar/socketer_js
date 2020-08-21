@@ -2,7 +2,7 @@
 
 # Install
 ```html
-
+<script type="application/javascript" src="https://aldienightstar.github.io/socketer_js/wsocketer.js"></script>
 ```
 
 # Client
