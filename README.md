@@ -19,7 +19,9 @@ let client = await wsocketer.newClient("ws://localhost:8080", "MyPassword", "MyN
 
         // Response to caller
         return { "echo": message }
-    }
+    },
+    // If you want to reconnect after connection fail
+    autoReconnect: true
 });
 ```
 

@@ -1,21 +1,53 @@
 const wsocketer = {};
 
 (() => {
-    wsocketer.newClient = function (url, password, name, options) {
+    wsocketer.newClient = function(url, password, name, options) {
         return new Promise((resolve, reject) => {
             let ws = new WebSocket(url);
             let state = 0;
             let messageReceivers = [];
             addSendAwait(ws);
-            let client = _client(name, ws, options, messageReceivers);
+
+            // Create client and create special object for it
+            let spec = {
+                ws,
+                disconnected: false,
+                reconnectedClient: null
+            }
+            let client = _client(name, spec, options, messageReceivers);
+
+            /**
+             * Reconnects client. Writes in "spec.reconnectedClient" new client. So then client have to delegate all the calls to it
+             */
+            async function reconnect() {
+                let rclient = await wsocketer.newClient(url, password, name, {
+                    ...options,
+                    onConnect: () => {
+                        spec.disconnected = false;
+                        if (options.onConnect) {
+                            options.onConnect();
+                        }
+                    },
+                    onDisconnect: async () => {
+                        spec.disconnected = true;
+                        if (options.onDisconnect) {
+                            options.onDisconnect();
+                        }
+                        spec.reconnectedClient = await reconnect();
+                    },
+                    autoReconnect: false
+                });
+                return rclient;
+            }
+
             ws.addEventListener("open", async () => {
                 if (state === 0) {
-                    let resp = (await ws.sendAwait(password)).data;
+                    let resp = await ws.sendAwait(password);
                     if (resp !== "AUTH OK") {
                         reject(new Error("Wrong password!"));
                         return;
                     }
-                    resp = (await ws.sendAwait(name)).data;
+                    resp = await ws.sendAwait(name);
                     if (resp !== "NAME OK") {
                         reject(new Error("Wrong name: " + resp));
                         return;
@@ -27,13 +59,22 @@ const wsocketer = {};
                     resolve(client);
                 }
             });
-            ws.addEventListener("close", () => {
+            ws.addEventListener("close", async () => {
                 if (options.onDisconnect) {
-                    options.onDisconnect();
+                    spec.disconnected = true;
+                    ws.close();
+                    if (options.onDisconnect) options.onDisconnect();
+                    if (options.autoReconnect) {
+                        if (spec.disconnectedManually) {
+                            delete spec.disconnectedManually;
+                        } else {
+                            spec.reconnectedClient = await reconnect();
+                        }
+                    }
                 }
             });
-            ws.addEventListener("message", async wsEvent => {
-                const msg = wsEvent.data;
+            ws.addEventListener('message', async msgEvt => {
+                let msg = msgEvt.data;
                 if (state === 1) {
                     let [sender, message] = splitWithTail(msg, " ", 1);
                     message = JSON.parse(message);
@@ -71,19 +112,26 @@ const wsocketer = {};
         });
     }
 
-    function _client(name, ws, options, messageReceivers) {
-        let closed = false;
+    function _client(name, spec, options, messageReceivers) {
         function formatMsg(name, msg) {
             return "SEND " + name + " " + msg;
         }
+
         async function send(name, messageData) {
-            if (closed) return;
+            // If client reconnected, then we have copy of that client,
+            // which is running inside our "spec" object.
+            // Delegate send call to this client
+            if (spec.reconnectedClient !== null) {
+                return await spec.reconnectedClient.send(...arguments);
+            }
+
             let msgObject = composeMessageObject(name, messageData);
 
             // Put new CallBack to messageReceivePromise which will resolve promise to await for message with the same identifier
             let messageReceivePromise = new Promise(ok => {
                 let func = incomeMessage => {
                     try {
+                        // Try to read message and if identifier is ok then return message data. Or null if identifiers are not equal
                         let data = readAnswerMessage(msgObject.identifier, incomeMessage)
                         if (data !== null && data !== undefined) {
                             ok(data);
@@ -106,8 +154,9 @@ const wsocketer = {};
                 }, 10000);
             })
 
-            let fmtMessage = formatMsg(name, JSON.stringify(msgObject));
-            ws.send(fmtMessage);
+            let formatedMessage = formatMsg(name, JSON.stringify(msgObject))
+            if (formatedMessage.length > 1024 * 128) throw new Error("Message is too big!");
+            spec.ws.send(formatedMessage);
 
             let resp = await awaitOrTimeout(messageReceivePromise, 9000);
             if (resp === null) throw new Error("Response time out!");
@@ -117,11 +166,20 @@ const wsocketer = {};
             return resp;
         }
         async function disconnect() {
-            if (closed) return;
-            closed = true;
-            ws.close();
+            spec.disconnectedManually = true;
+            if (spec.reconnectedClient) {
+                await spec.reconnectedClient.disconnect();
+                spec.reconnectedClient = null;
+                return;
+            }
+            if (spec.disconnected) return;
+            spec.disconnected = true;
+            spec.ws.close();
         }
         async function getOthers() {
+            if (spec.reconnectedClient) {
+                return await spec.reconnectedClient.getOthers();
+            }
             let resp = await send("SERVER", "NAMES");
             if (resp === undefined || resp === null) throw Error("Can't retreive list of clients.");
             if (!Array.isArray(resp)) throw Error("Error with retreiving list of clients: " + resp);
@@ -152,17 +210,16 @@ const wsocketer = {};
     }
 
     function addSendAwait(ws) {
-        ws.sendAwait = function (message) {
+        ws.sendAwait = function(message) {
             return new Promise((resolve, reject) => {
-                ws.addEventListener("message", function listener(msg) {
-                    resolve(msg);
+                ws.addEventListener('message', function listener(evt) {
+                    resolve(evt.data);
                     ws.removeEventListener("message", listener);
                 });
                 ws.send(message);
-            })
+            });
         }
     }
-
     // =======================================
     //   Message code
     // =======================================
